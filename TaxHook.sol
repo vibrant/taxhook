@@ -164,7 +164,7 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
      * @param customToken The token to transfer ownership of
      * @param newOwner The new owner address
      */
-    function transferTokenOwnership(address customToken, address newOwner) external {
+    function transferTokenOwnership(address customToken, address newOwner) external nonReentrant {
         TokenTaxConfig storage config = tokenTaxConfigs[customToken];
         require(config.enabled, "TaxHook: Token not registered");
         require(msg.sender == config.tokenOwner, "TaxHook: Only token owner can transfer");
@@ -173,10 +173,10 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
         require(newOwner != address(0), "TaxHook: Cannot transfer to zero address");
         require(newOwner != address(this), "TaxHook: Cannot transfer to hook contract");
 
-        // If there's an active tax rate or unwithrawn taxes, be extra cautious
+        // Auto-withdraw any unclaimed taxes to the current owner before transferring
         uint256 unwithdrawnTax = config.collected - config.withdrawn;
-        if (config.taxBps > 0 || unwithdrawnTax > 0) {
-            require(newOwner != address(0), "TaxHook: Cannot transfer active config to zero address");
+        if (unwithdrawnTax > 0) {
+            _withdrawTokenTaxInternal(config, config.tokenOwner, unwithdrawnTax);
         }
 
         address previousOwner = config.tokenOwner;
@@ -203,9 +203,10 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
      * @notice Withdraws accumulated token-specific taxes (in native ETH)
      * @param customToken The custom token whose tax to withdraw
      * @param recipient The address to send the withdrawn tax to
+     * @param amount The amount to withdraw (0 = withdraw all available)
      * @dev Only callable by the token owner
      */
-    function withdrawTokenTax(address customToken, address recipient) external nonReentrant {
+    function withdrawTokenTax(address customToken, address recipient, uint256 amount) external nonReentrant {
         require(recipient != address(0), "TaxHook: Invalid recipient");
 
         TokenTaxConfig storage config = tokenTaxConfigs[customToken];
@@ -215,18 +216,10 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
         uint256 unwithdrawnTotal = config.collected - config.withdrawn;
         require(unwithdrawnTotal > 0, "TaxHook: No taxes to withdraw");
 
-        // Check ETH balance
-        uint256 balance = address(this).balance;
-        require(balance >= unwithdrawnTotal, "TaxHook: Insufficient ETH balance");
+        // Determine actual withdrawal amount (cap to available if needed)
+        uint256 actualAmount = (amount == 0) ? unwithdrawnTotal : (amount > unwithdrawnTotal ? unwithdrawnTotal : amount);
 
-        // Update the withdrawn amount
-        config.withdrawn += unwithdrawnTotal;
-
-        // Transfer ETH to recipient
-        (bool success,) = recipient.call{value: unwithdrawnTotal}("");
-        require(success, "TaxHook: ETH transfer failed");
-
-        emit TaxWithdrawn(recipient, unwithdrawnTotal, false);
+        _withdrawTokenTaxInternal(config, recipient, actualAmount);
     }
 
     // ============================================
@@ -248,25 +241,29 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
 
     /**
      * @notice Withdraws accumulated owner taxes (in native ETH)
-     * @dev Only callable by owner. Withdraws all accumulated ETH across all tokens.
+     * @param amount The amount to withdraw (0 = withdraw all available)
+     * @dev Only callable by owner. Withdraws accumulated ETH across all tokens.
      */
-    function withdrawOwnerTax() external onlyOwner nonReentrant {
+    function withdrawOwnerTax(uint256 amount) external onlyOwner nonReentrant {
         // Calculate unwithdrawn amount
         uint256 unwithdrawnTotal = ownerTaxCollected - ownerTaxWithdrawn;
         require(unwithdrawnTotal > 0, "TaxHook: No owner taxes to withdraw");
 
+        // Determine actual withdrawal amount (cap to available if needed)
+        uint256 actualAmount = (amount == 0) ? unwithdrawnTotal : (amount > unwithdrawnTotal ? unwithdrawnTotal : amount);
+
         // Check ETH balance
         uint256 balance = address(this).balance;
-        require(balance >= unwithdrawnTotal, "TaxHook: Insufficient ETH balance");
+        require(balance >= actualAmount, "TaxHook: Insufficient ETH balance");
 
         // Update withdrawn amount
-        ownerTaxWithdrawn += unwithdrawnTotal;
+        ownerTaxWithdrawn += actualAmount;
 
         // Transfer ETH to owner
-        (bool success,) = owner().call{value: unwithdrawnTotal}("");
+        (bool success,) = owner().call{value: actualAmount}("");
         require(success, "TaxHook: ETH transfer failed");
 
-        emit TaxWithdrawn(owner(), unwithdrawnTotal, true);
+        emit TaxWithdrawn(owner(), actualAmount, true);
     }
 
     // ============================================
@@ -672,5 +669,32 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
         TokenTaxConfig storage config = tokenTaxConfigs[customToken];
         require(config.enabled, "TaxHook: Token not registered");
         return config.tokenOwner;
+    }
+
+    // ============================================
+    // INTERNAL HELPER FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Internal helper to withdraw token taxes
+     * @param config The token tax configuration
+     * @param recipient The address to send the withdrawn tax to
+     * @param amount The amount to withdraw
+     * @dev This function performs the actual withdrawal logic and is called by both
+     *      withdrawTokenTax and transferTokenOwnership to avoid code duplication
+     */
+    function _withdrawTokenTaxInternal(TokenTaxConfig storage config, address recipient, uint256 amount) private {
+        // Check ETH balance
+        uint256 balance = address(this).balance;
+        require(balance >= amount, "TaxHook: Insufficient ETH balance");
+
+        // Update the withdrawn amount
+        config.withdrawn += amount;
+
+        // Transfer ETH to recipient
+        (bool success,) = recipient.call{value: amount}("");
+        require(success, "TaxHook: ETH transfer failed");
+
+        emit TaxWithdrawn(recipient, amount, false);
     }
 }
