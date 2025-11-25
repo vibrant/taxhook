@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -106,8 +106,12 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
         address indexed customToken, address indexed previousOwner, address indexed newOwner
     );
 
+    // Event emitted when owner cut is updated
+    event OwnerCutUpdated(uint16 oldCutBps, uint16 newCutBps);
+
     constructor(IPoolManager _poolManager, address _owner, uint16 _ownerCutBps) BaseHook(_poolManager) {
-        require(_ownerCutBps < TAX_RATE_DENOMINATOR, "TaxHook: Owner cut too high");
+        require(_owner != address(0), "TaxHook: Invalid owner address");
+        require(_ownerCutBps <= Constants.MAX_OWNER_CUT_BPS, "TaxHook: Owner cut exceeds maximum");
 
         ownerCutBps = _ownerCutBps;
 
@@ -186,15 +190,22 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Update a token's tax rate (can only decrease, not increase)
+     * @notice Update a token's tax rate
      * @param customToken The token to update
-     * @param newTaxBps New tax rate in basis points (must be less than or equal to current rate)
+     * @param newTaxBps New tax rate in basis points
+     * @dev Decreases are always allowed. Increases are capped at MAX_TAX_INCREASE_BPS.
+     *      This allows launching with high tax (e.g., to prevent bots), decreasing gradually,
+     *      and later increasing back up to the cap if needed.
      */
     function updateTokenTaxRate(address customToken, uint16 newTaxBps) external {
         TokenTaxConfig storage config = tokenTaxConfigs[customToken];
         require(config.enabled, "TaxHook: Token not registered");
         require(msg.sender == config.tokenOwner, "TaxHook: Only token owner can update");
-        require(newTaxBps <= config.taxBps, "TaxHook: Can only decrease tax rate");
+
+        // Allow any decrease, but increases are capped at MAX_TAX_INCREASE_BPS
+        if (newTaxBps > config.taxBps) {
+            require(newTaxBps <= Constants.MAX_TAX_INCREASE_BPS, "TaxHook: Tax rate exceeds maximum for increase");
+        }
 
         config.taxBps = newTaxBps;
     }
@@ -264,6 +275,20 @@ contract TaxHook is BaseHook, Ownable, ReentrancyGuard {
         require(success, "TaxHook: ETH transfer failed");
 
         emit TaxWithdrawn(owner(), actualAmount, true);
+    }
+
+    /**
+     * @notice Update the owner's cut percentage
+     * @param newOwnerCutBps New owner cut in basis points
+     * @dev Only callable by owner. Capped at MAX_OWNER_CUT_BPS.
+     */
+    function setOwnerCutBps(uint16 newOwnerCutBps) external onlyOwner {
+        require(newOwnerCutBps <= Constants.MAX_OWNER_CUT_BPS, "TaxHook: Owner cut exceeds maximum");
+
+        uint16 oldCutBps = ownerCutBps;
+        ownerCutBps = newOwnerCutBps;
+
+        emit OwnerCutUpdated(oldCutBps, newOwnerCutBps);
     }
 
     // ============================================
